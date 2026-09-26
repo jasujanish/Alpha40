@@ -2,14 +2,17 @@ import torch
 
 DEFAULT_HEIGHT = 6
 DEFAULT_WIDTH = 7
-WIN_LENGTH = 4
+DEFAULT_WIN_LENGTH = 4
 
 class Board():
-    def __init__(self, height = DEFAULT_HEIGHT, width = DEFAULT_WIDTH, win_length = WIN_LENGTH, device = "cpu"):
+    def __init__(self, height = DEFAULT_HEIGHT, width = DEFAULT_WIDTH, win_length = DEFAULT_WIN_LENGTH, pieces = None, device = "cpu"):
         self.height = height
         self.width = width
-        self.win_length = WIN_LENGTH
-        self.pieces = torch.zeros((height, width), device=device, requires_grad=False)
+        self.win_length = win_length
+        if pieces is not None:
+            self.pieces = pieces
+        else:
+            self.pieces = torch.zeros((height, width), device=device, requires_grad=False)
 
     def add_stone(self, col, player):
         assert (0 <= col and col < self.width), "col out of order"
@@ -20,9 +23,12 @@ class Board():
     def get_moves(self):
         return self.pieces[0] == 0
 
-    def moves_left(self):
-        return (self.pieces[0] == 1).any()
-    
+    def non_full(self):
+        return (self.pieces[0] == 0).any().item()
+
+    def full(self):
+        return (self.pieces[0] != 0).all().item()
+
     def has_won(self, player):
         mask = self.pieces == player
         k = self.win_length
@@ -52,4 +58,13 @@ class Board():
 
     def __str__(self):
         return str(self.pieces)
-            
+
+    def copy(self):
+        new_board = Board(
+            height=self.height,
+            width=self.width,
+            win_length=self.win_length,
+            pieces=self.pieces.clone(),
+            device=self.pieces.device,
+        )
+        return new_board
