@@ -1,7 +1,8 @@
 import torch
 
 class Node:
-    def __init__(self, board, to_play=1):
+    '''Node in MCTS tree'''
+    def __init__(self, board, to_play=1): 
         if to_play not in (1, -1):
             raise ValueError("to_play must be 1 or -1")
         self.state = board.copy()
@@ -16,7 +17,20 @@ class Node:
         self.accum_results = {} # W(s,a)
         # Q(s,a) = W(s,a)/N(s,a)
 
+    def is_terminal(self):
+        return self.state.full() or self.state.has_won(1) or self.state.has_won(-1)
+
+    def result(self):
+        if self.state.has_won(1):
+            return 1
+        
+        if self.state.has_won(-1):
+            return -1
+
+        return 0
+    
 class MCTS:   
+    '''MCTS tree and associated search methods, we use 1 tree per game'''
     def __init__(self, board, model, to_play=1, c_puct = 1.0, device = 'cpu'):
         self.root_node = Node(board, to_play)
         self.c_puct = c_puct
@@ -108,7 +122,7 @@ class MCTS:
 
     def advance(self, move):
         '''move root node based on opponent move'''
-        if move not in self.root_node.moves:
+        if move not in self.root_node.moves or self.root_node.is_terminal():
             return False
         
         if move in self.root_node.children:

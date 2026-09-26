@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 
 class ResidualBlock(nn.Module):
+    '''ResNet like block, conv + batchnorm + relu + conv + batchnorm + residual + relu'''
     def __init__(self, filters=32, kernel_size = (3,3), stride=(1,1), padding=(1,1)):
         super().__init__()
         self.layers = nn.Sequential(
@@ -18,6 +19,7 @@ class ResidualBlock(nn.Module):
 
 
 class AlphaC4Zero(nn.Module):
+    '''Scaled down version of the alpha go zero architecture, trunk of repeated conv+residual blocks with separate value and policy heads'''
     def __init__(self, input_binary_chans=2, filters=32, kernel_size = (3,3), stride=(1,1), padding=(1,1), num_blocks = 8, hidden_dim = 32):
         super().__init__()
         self.trunk = nn.Sequential(

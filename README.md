@@ -31,5 +31,4 @@ Value Head
 - Flatten, Linear layer
     - (B, 42)
     - 42 -> Relu -> 1 -> Tanh
-    - -1 = loss, 0 = draw, 1 = win
-
+- -1 = loss, 0 = draw, 1 = win

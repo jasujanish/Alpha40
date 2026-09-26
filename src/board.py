@@ -5,6 +5,7 @@ DEFAULT_WIDTH = 7
 DEFAULT_WIN_LENGTH = 4
 
 class Board():
+    '''Board (tensor + functions) for connect 4'''
     def __init__(self, height = DEFAULT_HEIGHT, width = DEFAULT_WIDTH, win_length = DEFAULT_WIN_LENGTH, pieces = None, device = "cpu"):
         self.height = height
         self.width = width
