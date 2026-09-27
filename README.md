@@ -1,9 +1,25 @@
-## Goal
-- Train an agent to play Connect4 using only CPU via self play (loosely based on AlphaGoZero)
+## Motivation
+**AlphaGo Zero is Fascinating**
+In the 2017 AlphaGo Zero paper, researchers from Google DeepMind trained a model to be superhuman at Go without any human knowledge. Given the complexity of Go, it would be reasonable to assume that AlphaGo Zero relied on an extremely complex research breakthroughs. Yet, AlphaGo Zero is surprisingly simple.
+1. The main paper is 5 pages. The total paper is 18 pages long, but the majority of these pages consist of methods and references. 
+2. The paper trains a single neural network. 
+3. The network architecture is very similar to the ResNet architecture introduced in 2015.
+4. The training procedure is essentially self-play, with Monte Carlo Tree Search (MCTS) acting as a policy improvement operator,
+I'm fascinated by how a conceptually simple self-play-based algorithm and was able to prodcuce such an incredible model. As such, I wanted to reimplement this idea of self-play for game mastery.
+
+**Why Connect 4**
+I do not have access to compute comparable to what was used to train AlphaGo Zero. Attempting to reproduce the same methodology on Go with far less compute would therefore likely produce poor results. As such, I chose Connect 4 as my target game for 3 reasons:
+1. Connect 4 is substantially simpler than Go, so a strong policy would likely emerge with fewer training steps.
+2. Connect 4 is fully solved, so the trained policy can be compared against the optimal policy.
+3. I enjoy playing Connect 4.
 
 ## Model Architecture
 **Overview**
-The model architecture has a trunk consisting of stacked residual blocks and separate policy, value heads. The network takes in the board as binary planes and outputs move probabilities and a value between -1 (opponent win) and 1 (player win)
+- Model architecture: shared trunk of stacked residual blocks + separate policy and value heads
+- Input: board represented as binary planes
+- Outputs:
+    1. Move probabilities
+    2. Value score between -1 and 1 (-1 = opponent win, 0 = draw, 1 = current player win)
 
 **Trunk**
 - Input: (B, 6, 7, 2)
@@ -18,33 +34,26 @@ The model architecture has a trunk consisting of stacked residual blocks and sep
     - Output shape is (B, 6, 7, 32)
 
 **Policy Head**
-- Policy Convolution
-    - Conv 1x1 2 filters, batchnorm, relu
+- Feature Convolution
+    - Conv 1x1, 2 filters, stride 1, padding 0 -> batchnorm -> relu 
     - (B,6,7,2)
-- Flatten, Linear layer, Softmax
-    - (B, 84)
-    - 84 -> 7
-    - (set full columns to have logits of -\inf so they don't get included in the softmax)
-    - softmax to get move probs
-- Output: prob for each move
+- Extract Probs
+    - Flatten -> linear layer -> softmax
+    - Linear layer is fully connected, with 84 inputs and 7 outputs
+    - Before teh softmax, full-column logits are set to -inf, so their corresponding probabilities are 0 after the softmax
 
 **Value Head**
-- Value Convolution
-    - Conv 1x1, 1 filter, batchnorm, relu
+- Feature Convolution
+    - Conv 1x1, 1 filter, stride 1, padding 0 -> batchnorm -> relu
     - (B, 6, 7, 1)
-- Flatten, Linear layer
-    - (B, 42)
-    - 42 -> Relu -> 1 -> Tanh
-- Output: -1 = loss, 0 = draw, 1 = win
+- Extract Value
+    - Flatten -> linear layer -> relu -> linear layer -> tanh
+    - Both linear layers are fully connected, the 1st layer is 42->32 and the 2nd layer is 32->1
+    - Tanh produces an output between -1 and 1
 
 ## Optimal move solver
-- Candidate moves are graded with Pascal Pons' Connect Four solver (https://github.com/PascalPons/connect4), build it into `external/` (gitignored):
-```
-git clone https://github.com/PascalPons/connect4 external/connect4
-make -C external/connect4 c4solver
-curl -L -o external/connect4/7x6.book https://github.com/PascalPons/connect4/releases/download/book/7x6.book
-```
-- Solved positions are cached in `results/solver_cache.jsonl`, delete it to start fresh.
+- The optimal policy (which is **NOT** used at all during training) is Pascal Pons' Connect Four solver (https://github.com/PascalPons/connect4)
+- Solved positions are cached in `results/solver_cache.jsonl`
 
 ## Full setup instructions
 Pre-reqs: uv, git, cpp compiler
@@ -70,14 +79,13 @@ scripts/train.sh         # full run with the train.py defaults (10000 games, rou
 ```
 Notes:
 - Pass custom args via commandline (ex: `scripts/train.sh --num-simulations 50`)
-- Outputs go to `results/`: `best_model.pt`, `evaluation.csv`, `optimal_moves.png`, `match_score.png`, `best_checkpoint.png`
-- Training appends to `evaluation.csv`, delete it before starting a run
+- Outputs go to `results/`: `best_model.pt`, `evaluation.csv`, `match_score.png`, `best_checkpoint.png`, and a checkpoint at every eval in `checkpoints/`
+- After training, a final eval plays the best model against every checkpoint and writes `final_evaluation.csv` and `optimal_moves.png` (candidates in blue, the best checkpoint in red)
+- Training appends to `evaluation.csv` and adds to `checkpoints/`, delete both before starting a run
 - You do not need to delete `solver_cache.jsonl` can be kept
 
 **4. Play**
 ```
 scripts/play.sh                          # plays results/best_model.pt with 200 MCTS simulations per move
-scripts/play.sh --num-simulations 50 --model path/to/model.pt
 ```
-- Click a column (or press 1-7) to drop a stone, the buttons start a new game with you or the model going first
-- After each model move, the bars under the board show the network's move probs (light, `network prior %`) and the share of MCTS visits per move (dark, `search visits %`, the model plays the most visited), and the gauges below show the network's and the search's evaluation from the model's view (-1 loss, 0 draw, 1 win). The window can be resized
+- Creates an interactive game to play against the model

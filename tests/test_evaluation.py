@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from board import Board
 from model import AlphaC4Zero
 from optimal import OptimalSolver
-from train import eval, train, graph_results, main
+from train import eval, train, final_eval, graph_results, main
 
 
 def make_test_positions(count=32, empty_cells=10, seed=0):
@@ -131,9 +131,10 @@ class EvaluationTests(unittest.TestCase):
             self.assertTrue(self.model.training)
             self.assertFalse(self.best.training)
             graph_results(directory)
-            for name in ("evaluation.csv", "optimal_moves.png",
-                         "best_checkpoint.png", "match_score.png"):
+            for name in ("evaluation.csv", "best_checkpoint.png", "match_score.png"):
                 self.assertGreater((Path(directory) / name).stat().st_size, 0)
+            # optimal_moves.png comes from final_eval now
+            self.assertFalse((Path(directory) / "optimal_moves.png").exists())
             self.assertFalse(path.exists())
         for key, value in self.best.state_dict().items():
             self.assertTrue(torch.equal(value, before[key]))
@@ -179,9 +180,34 @@ class EvaluationTests(unittest.TestCase):
         events = []
         with patch.object(sys, "argv", ["train.py"]), patch("train.torch.save"), \
              patch("train.train", side_effect=lambda **kwargs: events.append("train")), \
+             patch("train.final_eval", side_effect=lambda *args, **kwargs: events.append("final_eval")), \
              patch("train.graph_results", side_effect=lambda path: events.append("graph")):
             main()
-        self.assertEqual(events, ["train", "graph"])
+        self.assertEqual(events, ["train", "final_eval", "graph"])
+
+    def test_final_eval_marks_best_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory, patch("train.OptimalSolver.optimal_moves", return_value={0, 1, 2, 3, 4, 5, 6}):
+            path = Path(directory) / "best_model.pt"
+            checkpoints = Path(directory) / "checkpoints"
+            checkpoints.mkdir()
+            torch.save(self.best.state_dict(), path)
+            torch.save(self.best.state_dict(), checkpoints / "checkpoint_300.pt")
+            with torch.no_grad():
+                next(self.model.parameters()).add_(1)
+            torch.save(self.model.state_dict(), checkpoints / "checkpoint_40.pt")
+
+            final_eval(path, 2, num_simulations=2, make_model=lambda: AlphaC4Zero(num_blocks=1, filters=4))
+            with (Path(directory) / "final_evaluation.csv").open() as file:
+                rows = list(csv.DictReader(file))
+            self.assertEqual([int(row["training_moves"]) for row in rows], [40, 300])
+            self.assertEqual([row["is_best"] for row in rows], ["False", "True"])
+            self.assertEqual([float(row["optimal_moves_percent"]) for row in rows], [100, 100])
+            self.assertGreater((Path(directory) / "optimal_moves.png").stat().st_size, 0)
+
+    def test_final_eval_without_checkpoints(self):
+        with tempfile.TemporaryDirectory() as directory:
+            final_eval(Path(directory) / "best_model.pt", 2, num_simulations=2)
+            self.assertEqual(list(Path(directory).iterdir()), [])
 
     def test_graph_with_no_evaluations(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -189,12 +215,14 @@ class EvaluationTests(unittest.TestCase):
             self.assertEqual(list(Path(directory).iterdir()), [])
 
     def test_training_passes_move_count_without_history(self):
-        with patch("train.eval") as evaluate:
-            train(self.model, self.best, "unused.pt", 2, 1, 2, "cpu", 2, 2, 1000, .001)
+        with tempfile.TemporaryDirectory() as directory, patch("train.eval") as evaluate:
+            train(self.model, self.best, Path(directory) / "best_model.pt", 2, 1, 2, "cpu", 2, 2, 1000, .001)
+            saved = sorted(int(path.stem.split("_")[1]) for path in (Path(directory) / "checkpoints").glob("checkpoint_*.pt"))
         self.assertEqual(evaluate.call_count, 2)
         first, second = [call.kwargs for call in evaluate.call_args_list]
         self.assertGreater(first["total_training_moves"], 0)
         self.assertGreater(second["total_training_moves"], first["total_training_moves"])
+        self.assertEqual(saved, [first["total_training_moves"], second["total_training_moves"]])
         self.assertNotIn("history", first)
         self.assertNotIn("benchmark", first)
 

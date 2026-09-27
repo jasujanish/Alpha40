@@ -49,45 +49,13 @@ else:
     from mcts import Node, MCTS
     from optimal import OptimalSolver
 
-def eval(model, best_model, best_model_path, eval_games, num_simulations=100, total_training_moves=0, progress=None):
+def play_match(candidate_model, best_model, eval_games, num_simulations, solver):
     '''
-    Eval the current current checkpoint against the best checkpoint
-    Data
-    - training_moves: self_play moves generated for current checkpoint during training
-    - wins: current checkpoint wins against best checkpoint
-    - draws: current checkpoint draws against best checkpoint
-    - losses: current checkpoint losses against best checkpoint
-    - mean_result: (num_wins-num_losses)/num_games
-    - match_score_percent: 100* (num_wins+0.5*num_draws) / num_games
-    - optimal_move_percent: percentage of candidate moves that were optimal (excluding first move, which is chosen randomly)
-    - candidate_moves: number of moves done by the candidate checkpoint during eval
-    - promoted: true if we update best_checkpoint, we update if mean_result > 0.05
-    - best_checkpoint_moves: self_play moves generated for the best checkpoint during training
+    Play eval_games games between candidate_model and best_model, each random opening is played from both sides
+    Returns candidate wins, draws, losses, optimal_count (candidate moves the solver marks optimal), candidate_moves
     '''
-    # prereq check
-    assert (eval_games >= 2 and eval_games % 2 == 0 and num_simulations >= 2), "eval pre-reqs failed"
-
-    # get best_checkpoint_moves
-    output_dir = Path(best_model_path).parent
-    output_dir.mkdir(parents=True, exist_ok=True)
-    results_path = output_dir / "evaluation.csv"
-    columns = ("training_moves", "wins", "draws", "losses", "mean_result", "match_score_percent", "optimal_moves_percent", "candidate_moves", "promoted", "best_checkpoint_moves")
-    best_checkpoint_moves = 0
-    if results_path.exists() and results_path.stat().st_size:
-        with results_path.open(newline="") as file:
-            reader = csv.reader(file)
-            if next(reader) != list(columns):
-                raise ValueError("wrong columns")
-            for row in reader:
-                best_checkpoint_moves = int(row[-1])
-
-    # get candidate, best models
-    candidate_model = deepcopy(model).eval()
-    candidate_model.requires_grad_(False)
     candidate_device = next(candidate_model.parameters()).device
     best_device = next(best_model.parameters()).device
-    best_model.eval()
-    solver = OptimalSolver(cache_path=output_dir / "solver_cache.jsonl")
     wins = draws = losses = optimal_count = candidate_moves = 0
     rng = random.Random()
 
@@ -127,6 +95,46 @@ def eval(model, best_model, best_model_path, eval_games, num_simulations=100, to
                 draws += (result == 0)
                 losses += (result == -1)
 
+    return wins, draws, losses, optimal_count, candidate_moves
+
+def eval(model, best_model, best_model_path, eval_games, num_simulations=100, total_training_moves=0, progress=None):
+    '''
+    Eval the current current checkpoint against the best checkpoint
+    Data
+    - training_moves: self_play moves generated for current checkpoint during training
+    - wins: current checkpoint wins against best checkpoint
+    - draws: current checkpoint draws against best checkpoint
+    - losses: current checkpoint losses against best checkpoint
+    - mean_result: (num_wins-num_losses)/num_games
+    - match_score_percent: 100* (num_wins+0.5*num_draws) / num_games
+    - optimal_move_percent: percentage of candidate moves that were optimal (excluding first move, which is chosen randomly)
+    - candidate_moves: number of moves done by the candidate checkpoint during eval
+    - promoted: true if we update best_checkpoint, we update if mean_result > 0.05
+    - best_checkpoint_moves: self_play moves generated for the best checkpoint during training
+    '''
+    # prereq check
+    assert (eval_games >= 2 and eval_games % 2 == 0 and num_simulations >= 2), "eval pre-reqs failed"
+
+    # get best_checkpoint_moves
+    output_dir = Path(best_model_path).parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+    results_path = output_dir / "evaluation.csv"
+    columns = ("training_moves", "wins", "draws", "losses", "mean_result", "match_score_percent", "optimal_moves_percent", "candidate_moves", "promoted", "best_checkpoint_moves")
+    best_checkpoint_moves = 0
+    if results_path.exists() and results_path.stat().st_size:
+        with results_path.open(newline="") as file:
+            reader = csv.reader(file)
+            if next(reader) != list(columns):
+                raise ValueError("wrong columns")
+            for row in reader:
+                best_checkpoint_moves = int(row[-1])
+
+    # get candidate, best models
+    candidate_model = deepcopy(model).eval()
+    candidate_model.requires_grad_(False)
+    best_model.eval()
+    solver = OptimalSolver(cache_path=output_dir / "solver_cache.jsonl")
+    wins, draws, losses, optimal_count, candidate_moves = play_match(candidate_model, best_model, eval_games, num_simulations, solver)
     solver.close()
 
     # Calculate final score, update if candidate beats best
@@ -164,7 +172,6 @@ def graph_results(output_dir):
     if not rows:
         return
     plots = (
-        (6, "Optimal moves (%)", "Candidate moves in fresh evaluation games", "optimal_moves.png"),
         (9, "Training moves at best checkpoint", "Best checkpoint over time", "best_checkpoint.png"),
         (5, "Match score (%)", "Candidate versus previous best (draw = half point)", "match_score.png"),
     )
@@ -174,10 +181,56 @@ def graph_results(output_dir):
         axes = figure.subplots()
         axes.scatter([int(row[0]) for row in rows], [float(row[index]) for row in rows])
         axes.set(xlabel="Total self-play training moves", ylabel=ylabel, title=title)
-        if index in (5, 6):
+        if index == 5:
             axes.set_ylim(0, 100)
         axes.grid(alpha=0.25)
         figure.savefig(output_dir / filename, dpi=150)
+
+def final_eval(best_model_path, eval_games, num_simulations=100, device="cpu", make_model=AlphaC4Zero):
+    '''
+    Eval the best model against every saved checkpoint, then graph each checkpoint's optimal move percentage
+    - results/final_evaluation.csv: training_moves, wins, draws, losses (from the checkpoint's view), optimal_moves_percent, is_best
+    - results/optimal_moves.png: training moves vs optimal moves, candidates in blue and the best checkpoint in red
+    make_model builds an untrained network with the same architecture the checkpoints were saved from
+    '''
+    output_dir = Path(best_model_path).parent
+    checkpoints = sorted((output_dir / "checkpoints").glob("checkpoint_*.pt"), key=lambda path: int(path.stem.split("_")[1]))
+    if not checkpoints:
+        return
+
+    best_model = make_model().to(device)
+    best_state = torch.load(best_model_path, map_location=device, weights_only=True)
+    best_model.load_state_dict(best_state)
+    best_model.eval().requires_grad_(False)
+    solver = OptimalSolver(cache_path=output_dir / "solver_cache.jsonl")
+
+    rows = []
+    for path in tqdm(checkpoints, desc="Final eval", unit="checkpoint"):
+        state = torch.load(path, map_location=device, weights_only=True)
+        candidate = make_model().to(device)
+        candidate.load_state_dict(state)
+        candidate.eval().requires_grad_(False)
+        wins, draws, losses, optimal_count, candidate_moves = play_match(candidate, best_model, eval_games, num_simulations, solver)
+        is_best = all(torch.equal(state[key], best_state[key]) for key in best_state)
+        rows.append((int(path.stem.split("_")[1]), wins, draws, losses, 100 * optimal_count / candidate_moves if candidate_moves else 0.0, is_best))
+    solver.close()
+
+    with (output_dir / "final_evaluation.csv").open("w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(("training_moves", "wins", "draws", "losses", "optimal_moves_percent", "is_best"))
+        writer.writerows(rows)
+
+    figure = Figure(figsize=(7, 4), layout="constrained")
+    FigureCanvasAgg(figure)
+    axes = figure.subplots()
+    for is_best, color, label in ((False, "tab:blue", "Candidate checkpoint"), (True, "tab:red", "Best checkpoint")):
+        points = [(row[0], row[4]) for row in rows if row[5] == is_best]
+        if points:
+            axes.scatter(*zip(*points), color=color, label=label, zorder=3 if is_best else 2)
+    axes.set(xlabel="Total self-play training moves", ylabel="Optimal moves (%)", title="Checkpoints versus the best model", ylim=(0, 100))
+    axes.legend()
+    axes.grid(alpha=0.25)
+    figure.savefig(output_dir / "optimal_moves.png", dpi=150)
 
 def train(model, best_model, best_model_path, num_training_games, eval_every, eval_games, device, batch_size, num_simulations, buffer_size, lr, sampling_moves=10):
     '''Train the model with MCTS self play'''
@@ -231,8 +284,11 @@ def train(model, best_model, best_model_path, num_training_games, eval_every, ev
         for state, policy, to_play in moves_to_add:
             buffer.add((state, policy, result * to_play))
 
-        # eval if needed
+        # save a checkpoint and eval if needed
         if (i + 1) % eval_every == 0:
+            checkpoint_dir = Path(best_model_path).parent / "checkpoints"
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(model.state_dict(), checkpoint_dir / f"checkpoint_{total_training_moves}.pt")
             eval(model, best_model, best_model_path, eval_games, num_simulations=num_simulations, total_training_moves=total_training_moves, progress=progress)
 
 def main():
@@ -285,6 +341,7 @@ def main():
         sampling_moves=args.sampling_moves,
     )
 
+    final_eval(best_model_path, args.eval_games, num_simulations=args.num_simulations, device=device)
     graph_results(best_model_path.parent)
 
 
