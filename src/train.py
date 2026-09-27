@@ -34,6 +34,7 @@ import torch
 import torch.optim as optim
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
+from tqdm import tqdm
 
 if __package__:
     from .model import AlphaC4Zero
@@ -48,7 +49,7 @@ else:
     from mcts import Node, MCTS
     from optimal import OptimalSolver
 
-def eval(model, best_model, best_model_path, eval_games, num_simulations=100, total_training_moves=0):
+def eval(model, best_model, best_model_path, eval_games, num_simulations=100, total_training_moves=0, progress=None):
     '''
     Eval the current current checkpoint against the best checkpoint
     Data
@@ -86,7 +87,7 @@ def eval(model, best_model, best_model_path, eval_games, num_simulations=100, to
     candidate_device = next(candidate_model.parameters()).device
     best_device = next(best_model.parameters()).device
     best_model.eval()
-    solver = OptimalSolver()
+    solver = OptimalSolver(cache_path=output_dir / "solver_cache.jsonl")
     wins = draws = losses = optimal_count = candidate_moves = 0
     rng = random.Random()
 
@@ -126,6 +127,8 @@ def eval(model, best_model, best_model_path, eval_games, num_simulations=100, to
                 draws += (result == 0)
                 losses += (result == -1)
 
+    solver.close()
+
     # Calculate final score, update if candidate beats best
     mean_result = (wins - losses) / eval_games
     promoted = mean_result > 0.05
@@ -144,21 +147,21 @@ def eval(model, best_model, best_model_path, eval_games, num_simulations=100, to
         if new_file:
             writer.writerow(columns)
         writer.writerow((total_training_moves, wins, draws, losses, mean_result, 100 * (wins + .5 * draws) / eval_games, optimal_percent, candidate_moves, promoted, best_checkpoint_moves))
-    print(f"Eval at {total_training_moves} moves: {wins}W/{draws}D/{losses}L optimal moves {optimal_percent:.1f}%, promoted={promoted}", flush=True)
+    if progress is not None:
+        progress.set_postfix(eval_WDL=f"{wins}/{draws}/{losses}", optimal=f"{optimal_percent:.1f}%", promoted=str(promoted))
+    return promoted
 
 def graph_results(output_dir):
     '''Generate plots based on eval results'''
     output_dir = Path(output_dir)
     results_path = output_dir / "evaluation.csv"
     if not results_path.exists() or not results_path.stat().st_size:
-        print("No evaluation results to graph.")
         return
     with results_path.open(newline="") as file:
         reader = csv.reader(file)
         next(reader)
         rows = list(reader)
     if not rows:
-        print("No evaluation results to graph.")
         return
     plots = (
         (6, "Optimal moves (%)", "Candidate moves in fresh evaluation games", "optimal_moves.png"),
@@ -176,14 +179,15 @@ def graph_results(output_dir):
         axes.grid(alpha=0.25)
         figure.savefig(output_dir / filename, dpi=150)
 
-def train(model, best_model, best_model_path, num_training_games, eval_every, eval_games, device, batch_size, num_simulations, buffer_size, lr):
+def train(model, best_model, best_model_path, num_training_games, eval_every, eval_games, device, batch_size, num_simulations, buffer_size, lr, sampling_moves=10):
     '''Train the model with MCTS self play'''
     optimizer = optim.AdamW(params=model.parameters(), lr=lr)
     buffer = ReplayBuffer(buffer_size=buffer_size, batch_size=batch_size)
     model.train()
     total_training_moves = 0
     
-    for i in range(num_training_games):
+    progress = tqdm(range(num_training_games), desc="Self-play games", unit="game")
+    for i in progress:
         moves_to_add = []
         game_tree = MCTS(board=Board(device=device), model=best_model, device=device)
         while not game_tree.root_node.is_terminal():
@@ -191,7 +195,11 @@ def train(model, best_model, best_model_path, num_training_games, eval_every, ev
             move = game_tree.search(num_simulations)
             root = game_tree.root_node
             policy = torch.tensor([root.visit_counts.get(a, 0) for a in range(root.state.width)], dtype=torch.float32) 
-            policy /= policy.sum() # note: alpha go sampling used temperature, this is a simplification
+            policy /= policy.sum()
+
+            # Sample from visit counts (temperature 1) for the opening moves, then play the most visited move
+            if len(moves_to_add) < sampling_moves:
+                move = torch.multinomial(policy, 1).item()
 
             # Create transition state for buffer
             pieces = root.state.pieces
@@ -225,7 +233,7 @@ def train(model, best_model, best_model_path, num_training_games, eval_every, ev
 
         # eval if needed
         if (i + 1) % eval_every == 0:
-            eval(model, best_model, best_model_path, eval_games, num_simulations=num_simulations, total_training_moves=total_training_moves)
+            eval(model, best_model, best_model_path, eval_games, num_simulations=num_simulations, total_training_moves=total_training_moves, progress=progress)
 
 def main():
     parser = argparse.ArgumentParser(description="Train AlphaGo Zero for Connect Four.")
@@ -237,12 +245,15 @@ def main():
     parser.add_argument("--num-simulations", type=int, default=100)
     parser.add_argument("--buffer-size", type=int, default=100000)
     parser.add_argument("--lr", type=float, default=0.001)
+    parser.add_argument("--sampling-moves", type=int, default=10)
 
     args = parser.parse_args()
 
     for name in ("num_training_games", "eval_every", "eval_games", "batch_size", "buffer_size", "lr"):
         if getattr(args, name) <= 0:
             parser.error(f"{name} must be positive")
+    if args.sampling_moves < 0:
+        parser.error("sampling_moves must be non-negative")
     if args.num_simulations < 2:
         parser.error("num_simulations must be at least 2")
     if args.eval_games < 2 or args.eval_games % 2:
@@ -271,6 +282,7 @@ def main():
         num_simulations=args.num_simulations,
         buffer_size=args.buffer_size,
         lr = args.lr,
+        sampling_moves=args.sampling_moves,
     )
 
     graph_results(best_model_path.parent)
