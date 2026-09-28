@@ -1,29 +1,3 @@
-'''
-Plan:
-main function
-- Take in num_training_games, eval_every, eval_games, device, batch size, num_simulations, buffer size as command line arguments
-- Init random network on device, save it as the "best model"
-- call train
-
-train
-- init AdamW optimizer
-- init replay buffer
-- for i in range(num_training_games):
-    - node = empty board node, toplay = 1
-    - while node is not terminal
-        - play the game
-        - do an optimizer step
-    - add all game moves to the buffer (buffer size is num moves in model)
-    - every eval_every games, benchmark model performance 
-
-eval
-- runs eval_games games between the old best and new best
-- update best model if needed (update best model if avg result is greater than 0.05)
-- since connect 4 is solved, we can calculate the percentage of moves that were optimal at this checkpoint
-- log the percent optimal moves - scatter plot, percent as y and total training moves as x
-- log best checkpoint over time - scatter plot, num moves used to train the best checkpoint as y, total training moves as x
-'''
-
 import argparse
 import csv
 import random
@@ -49,13 +23,10 @@ else:
     from mcts import Node, MCTS
     from optimal import OptimalSolver
 
-def play_match(candidate_model, best_model, eval_games, num_simulations, solver):
-    '''
-    Play eval_games games between candidate_model and best_model, each random opening is played from both sides
-    Returns candidate wins, draws, losses, optimal_count (candidate moves the solver marks optimal), candidate_moves
-    '''
+def play_match(candidate_model, opponent_model, eval_games, num_simulations, solver):
+    '''Play eval_games games between candidate_model and an opponent'''
     candidate_device = next(candidate_model.parameters()).device
-    best_device = next(best_model.parameters()).device
+    opponent_device = next(opponent_model.parameters()).device if opponent_model is not None else None
     wins = draws = losses = optimal_count = candidate_moves = 0
     rng = random.Random()
 
@@ -67,30 +38,31 @@ def play_match(candidate_model, best_model, eval_games, num_simulations, solver)
             first_move = rng.randrange(opening.width)
             opening.add_stone(first_move, 1)
 
-            # Have each model play from both sides of that first move
+            # Have each side play from both sides of that first move
             for candidate_player in (1, -1):
-                trees = {
-                    candidate_player: MCTS(opening, candidate_model, to_play=-1, device=candidate_device),
-                    -candidate_player: MCTS(opening, best_model, to_play=-1, device=best_device),
-                }
+                candidate_tree = MCTS(opening, candidate_model, to_play=-1, device=candidate_device)
+                opponent_tree = MCTS(opening, opponent_model, to_play=-1, device=opponent_device) if opponent_model is not None else None
                 to_play = -1
 
-                # play till checkpoint tree reaches terminal state
-                while not trees[1].root_node.is_terminal():
-                    tree = trees[to_play]
-                    move = tree.search(num_simulations)
+                # play till the game reaches a terminal state
+                while not candidate_tree.root_node.is_terminal():
+                    state = candidate_tree.root_node.state
                     if to_play == candidate_player:
-                        optimal_moves = solver.optimal_moves(tree.root_node.state, to_play)
-                        is_optimal = move in optimal_moves
+                        move = candidate_tree.search(num_simulations)
                         candidate_moves += 1
-                        optimal_count += is_optimal
-                    for tree in trees.values():
-                        if not tree.advance(move):
+                        optimal_count += move in solver.optimal_moves(state, to_play)
+                    elif opponent_tree is not None:
+                        move = opponent_tree.search(num_simulations)
+                    else:
+                        legal = set(state.get_moves().nonzero(as_tuple=True)[0].tolist())
+                        move = rng.choice(sorted(solver.optimal_moves(state, to_play) & legal))
+                    for tree in (candidate_tree, opponent_tree):
+                        if tree is not None and not tree.advance(move):
                             raise RuntimeError("Evaluation trees failed to advance")
                     to_play = -to_play
 
-                # update staets based on the current 
-                result = trees[1].root_node.result() * candidate_player
+                # update stats from the candidate's view
+                result = candidate_tree.root_node.result() * candidate_player
                 wins += (result == 1)
                 draws += (result == 0)
                 losses += (result == -1)
@@ -187,12 +159,7 @@ def graph_results(output_dir):
         figure.savefig(output_dir / filename, dpi=150)
 
 def final_eval(best_model_path, eval_games, num_simulations=100, device="cpu", make_model=AlphaC4Zero):
-    '''
-    Eval the best model against every saved checkpoint, then graph each checkpoint's optimal move percentage
-    - results/final_evaluation.csv: training_moves, wins, draws, losses (from the checkpoint's view), optimal_moves_percent, is_best
-    - results/optimal_moves.png: training moves vs optimal moves, candidates in blue and the best checkpoint in red
-    make_model builds an untrained network with the same architecture the checkpoints were saved from
-    '''
+    '''Play every saved checkpoint against the best model and against the optimal player'''
     output_dir = Path(best_model_path).parent
     checkpoints = sorted((output_dir / "checkpoints").glob("checkpoint_*.pt"), key=lambda path: int(path.stem.split("_")[1]))
     if not checkpoints:
@@ -204,6 +171,12 @@ def final_eval(best_model_path, eval_games, num_simulations=100, device="cpu", m
     best_model.eval().requires_grad_(False)
     solver = OptimalSolver(cache_path=output_dir / "solver_cache.jsonl")
 
+    def match_score(wins, draws, losses):
+        return 100 * (wins + 0.5 * draws) / (wins + draws + losses)
+
+    def mean_result(wins, draws, losses):
+        return (wins - losses) / (wins + draws + losses)
+
     rows = []
     for path in tqdm(checkpoints, desc="Final eval", unit="checkpoint"):
         state = torch.load(path, map_location=device, weights_only=True)
@@ -211,26 +184,45 @@ def final_eval(best_model_path, eval_games, num_simulations=100, device="cpu", m
         candidate.load_state_dict(state)
         candidate.eval().requires_grad_(False)
         wins, draws, losses, optimal_count, candidate_moves = play_match(candidate, best_model, eval_games, num_simulations, solver)
+        optimal_losses, optimal_draws, optimal_wins, _, _ = play_match(candidate, None, eval_games, num_simulations, solver)
         is_best = all(torch.equal(state[key], best_state[key]) for key in best_state)
-        rows.append((int(path.stem.split("_")[1]), wins, draws, losses, 100 * optimal_count / candidate_moves if candidate_moves else 0.0, is_best))
+        rows.append({
+            "training_moves": int(path.stem.split("_")[1]),
+            "wins": wins, "draws": draws, "losses": losses,
+            "match_score": match_score(wins, draws, losses), "mean_result": mean_result(wins, draws, losses),
+            "optimal_wins": optimal_wins, "optimal_draws": optimal_draws, "optimal_losses": optimal_losses,
+            "optimal_match_score": match_score(optimal_wins, optimal_draws, optimal_losses),
+            "optimal_mean_result": mean_result(optimal_wins, optimal_draws, optimal_losses),
+            "optimal_moves_percent": 100 * optimal_count / candidate_moves if candidate_moves else 0.0,
+            "is_best": is_best,
+        })
     solver.close()
 
     with (output_dir / "final_evaluation.csv").open("w", newline="") as file:
-        writer = csv.writer(file)
-        writer.writerow(("training_moves", "wins", "draws", "losses", "optimal_moves_percent", "is_best"))
+        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+        writer.writeheader()
         writer.writerows(rows)
 
-    figure = Figure(figsize=(7, 4), layout="constrained")
-    FigureCanvasAgg(figure)
-    axes = figure.subplots()
-    for is_best, color, label in ((False, "tab:blue", "Candidate checkpoint"), (True, "tab:red", "Best checkpoint")):
-        points = [(row[0], row[4]) for row in rows if row[5] == is_best]
-        if points:
-            axes.scatter(*zip(*points), color=color, label=label, zorder=3 if is_best else 2)
-    axes.set(xlabel="Total self-play training moves", ylabel="Optimal moves (%)", title="Checkpoints versus the best model", ylim=(0, 100))
-    axes.legend()
-    axes.grid(alpha=0.25)
-    figure.savefig(output_dir / "optimal_moves.png", dpi=150)
+    plots = (
+        ("match_score", "Match score (%)", "Checkpoints versus the best model (draw = half point)", "final_match_score_vs_best.png"),
+        ("optimal_match_score", "Optimal player's match score (%)", "Optimal player versus the checkpoints (draw = half point)", "final_match_score_optimal.png"),
+        ("mean_result", "Mean result", "Checkpoints versus the best model ((wins - losses) / games)", "final_mean_result_vs_best.png"),
+        ("optimal_mean_result", "Optimal player's mean result", "Optimal player versus the checkpoints ((wins - losses) / games)", "final_mean_result_optimal.png"),
+    )
+    for key, ylabel, title, filename in plots:
+        figure = Figure(figsize=(7, 4), layout="constrained")
+        FigureCanvasAgg(figure)
+        axes = figure.subplots()
+        for is_best, color, label in ((False, "tab:blue", "Candidate checkpoint"), (True, "tab:red", "Best checkpoint")):
+            points = [(row["training_moves"], row[key]) for row in rows if row["is_best"] == is_best]
+            if points:
+                axes.scatter(*zip(*points), color=color, label=label, zorder=3 if is_best else 2)
+        score = key.endswith("match_score")
+        axes.axhline(50 if score else 0, color="gray", linewidth=0.8, zorder=1) # even result
+        axes.set(xlabel="Total self-play training moves", ylabel=ylabel, title=title, ylim=(0, 100) if score else (-1.05, 1.05))
+        axes.legend()
+        axes.grid(alpha=0.25)
+        figure.savefig(output_dir / filename, dpi=150)
 
 def train(model, best_model, best_model_path, num_training_games, eval_every, eval_games, device, batch_size, num_simulations, buffer_size, lr, sampling_moves=10):
     '''Train the model with MCTS self play'''

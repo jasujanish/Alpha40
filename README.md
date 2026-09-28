@@ -79,8 +79,7 @@ scripts/train.sh         # full run with the train.py defaults (10000 games, rou
 ```
 Notes:
 - Pass custom args via commandline (ex: `scripts/train.sh --num-simulations 50`)
-- Outputs go to `results/`: `best_model.pt`, `evaluation.csv`, `match_score.png`, `best_checkpoint.png`, and a checkpoint at every eval in `checkpoints/`
-- After training, a final eval plays the best model against every checkpoint and writes `final_evaluation.csv` and `optimal_moves.png` (candidates in blue, the best checkpoint in red)
+- Outputs go to `results/`
 - Training appends to `evaluation.csv` and adds to `checkpoints/`, delete both before starting a run
 - You do not need to delete `solver_cache.jsonl` can be kept
 

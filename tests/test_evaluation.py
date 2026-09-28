@@ -202,7 +202,16 @@ class EvaluationTests(unittest.TestCase):
             self.assertEqual([int(row["training_moves"]) for row in rows], [40, 300])
             self.assertEqual([row["is_best"] for row in rows], ["False", "True"])
             self.assertEqual([float(row["optimal_moves_percent"]) for row in rows], [100, 100])
-            self.assertGreater((Path(directory) / "optimal_moves.png").stat().st_size, 0)
+            for row in rows:
+                for prefix in ("", "optimal_"):
+                    wins, draws, losses = (int(row[f"{prefix}{key}"]) for key in ("wins", "draws", "losses"))
+                    self.assertEqual(wins + draws + losses, 2)
+                    self.assertAlmostEqual(float(row[f"{prefix}match_score"]), 100 * (wins + 0.5 * draws) / 2)
+                    self.assertAlmostEqual(float(row[f"{prefix}mean_result"]), (wins - losses) / 2)
+            for name in ("final_match_score_vs_best.png", "final_match_score_optimal.png",
+                         "final_mean_result_vs_best.png", "final_mean_result_optimal.png"):
+                self.assertGreater((Path(directory) / name).stat().st_size, 0)
+            self.assertFalse((Path(directory) / "optimal_moves.png").exists())
 
     def test_final_eval_without_checkpoints(self):
         with tempfile.TemporaryDirectory() as directory:
